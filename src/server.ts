@@ -1,6 +1,8 @@
 import Fastify from "fastify";
 import { weatherDateSchema, weatherCitySchema } from "./schemas/weather";
-import { createClient } from "redis";
+import IORedis from "ioredis";
+import rateLimit from "@fastify/rate-limit";
+
 const weatherAPIKEY = process.env.WEATHER_API_KEY || "";
 const DEF_TTL = 3600;
 
@@ -20,13 +22,17 @@ const app = Fastify({
 // Cliente Redis
 let redis;
 try {
-  redis = await createClient()
-    .on("error", (err) => console.log("Redis Client Error", err))
-    .connect();
+  redis = new IORedis();
 } catch (err) {
   console.error("No se pudo conectar a Redis. ¿Está corriendo?", err);
   process.exit(1);
 }
+
+await app.register(rateLimit, {
+  max: 10,
+  timeWindow: "1 minute",
+  redis: redis,
+});
 
 app.get("/", function (request, reply) {
   reply.send({ hello: "world" });
@@ -35,38 +41,120 @@ app.get("/", function (request, reply) {
 const baseURL = process.env.ENDPOINT_URL;
 
 // Ruta para obtener clima de una localidad en los proximos 15 dias
-app.get("/weather", async (req, res) => {
-  const { city } = req.query as {
-    city: string;
-  };
+app.get(
+  "/weather",
+  {
+    config: {
+      rateLimit: {
+        max: 5,
+        timeWindow: "1 minute",
+      },
+    },
+  },
+  async (req, res) => {
+    const { city } = req.query as {
+      city: string;
+    };
 
-  // 1. Validar que venga una ciudad
-  if (!city) {
-    res.status(400).send({ error: "Todos los parámetros son requeridos" });
-    return;
-  }
+    // 1. Validar que venga una ciudad
+    if (!city) {
+      res.status(400).send({ error: "Todos los parámetros son requeridos" });
+      return;
+    }
 
-  // Validacion por separado
-  try {
-    weatherCitySchema.parse({ city });
-  } catch (err) {
-    console.error(err);
-    res.status(400).send({ message: "Datos invalidos" });
-    return;
-  }
-
-  // 3. Buscar en cache
-  const cacheKey = `cities:${city}`;
-  const cachedData = await redis.get(cacheKey);
-  if (cachedData) {
-    console.log(`\nCACHE HIT\n`);
-    res.send(JSON.parse(cachedData));
-    return;
-  } else {
-    // 4. Llamar la API externa
-    const url = `${baseURL}/${city}?unitGroup=metric&key=${weatherAPIKEY}`;
+    // Validacion por separado
     try {
-      console.log(`\nCACHE FAILED\n`);
+      weatherCitySchema.parse({ city });
+    } catch (err) {
+      console.error(err);
+      res.status(400).send({ message: "Datos invalidos" });
+      return;
+    }
+
+    // 3. Buscar en cache
+    const cacheKey = `cities:${city}`;
+    const cachedData = await redis.get(cacheKey);
+    if (cachedData) {
+      console.log(`\nCACHE HIT\n`);
+      res.send(JSON.parse(cachedData));
+      return;
+    } else {
+      // 4. Llamar la API externa
+      const url = `${baseURL}/${city}?unitGroup=metric&key=${weatherAPIKEY}`;
+      try {
+        console.log(`\nCACHE FAILED\n`);
+        console.log("Fetching:", url);
+        const response = await fetch(url);
+
+        if (!response.ok) {
+          res
+            .status(response.status)
+            .send({ error: "No se pudo obtener el clima para esa ciudad" });
+          return;
+        }
+
+        const data = await response.json();
+        await redis.setex(cacheKey, DEF_TTL, JSON.stringify(data));
+        res.send(data);
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Error al obtener el clima" });
+        return;
+      }
+    }
+  },
+);
+
+// Ruta para obtener clima de una localidad entre una fecha especifica
+app.get(
+  "/weather/period",
+  {
+    config: {
+      rateLimit: {
+        max: 5,
+        timeWindow: "1 minute",
+      },
+    },
+  },
+  async (req, res) => {
+    const { city, date1, date2 } = req.query as {
+      city: string;
+      date1: string;
+      date2: string;
+    };
+
+    // 1. Validar que vengan los parametros
+    if (!city || !date1 || !date2) {
+      res.status(400).send({ error: "Todos los parámetros son requeridos" });
+      return;
+    }
+
+    // Validar input
+    try {
+      weatherDateSchema.parse({ city, date1, date2 });
+      if (new Date(date1) > new Date(date2)) {
+        res.status(400).send({ message: "Fecha 1 debe ser menor a fecha 2" });
+        return;
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(400).send({ message: "Datos invalidos" });
+      return;
+    }
+
+    // Redis cache
+    const cacheKey = `cities:${city}:${date1}:${date2}`;
+    const cachedData = await redis.get(cacheKey);
+    if (cachedData) {
+      console.log(`\nCACHE HIT\n`);
+      res.send(JSON.parse(cachedData));
+      return;
+    }
+
+    const url = `${baseURL}/${city}/${date1}/${date2}?unitGroup=metric&key=${weatherAPIKEY}`;
+
+    // 4. Llamar la API externa
+    try {
       console.log("Fetching:", url);
       const response = await fetch(url);
 
@@ -76,76 +164,16 @@ app.get("/weather", async (req, res) => {
           .send({ error: "No se pudo obtener el clima para esa ciudad" });
         return;
       }
-
       const data = await response.json();
-      await redis.setEx(cacheKey, DEF_TTL, JSON.stringify(data));
+      await redis.setex(cacheKey, DEF_TTL, JSON.stringify(data));
       res.send(data);
     } catch (err) {
       console.error(err);
-      res.status(500).send({ message: "Error al obtener el clima" });
+      res.status(500).send();
       return;
     }
-  }
-});
-
-// Ruta para obtener clima de una localidad entre una fecha especifica
-app.get("/weather/period", async (req, res) => {
-  const { city, date1, date2 } = req.query as {
-    city: string;
-    date1: string;
-    date2: string;
-  };
-
-  // 1. Validar que vengan los parametros
-  if (!city || !date1 || !date2) {
-    res.status(400).send({ error: "Todos los parámetros son requeridos" });
-    return;
-  }
-
-  // Validar input
-  try {
-    await weatherDateSchema.parse({ city, date1, date2 });
-    if (new Date(date1) > new Date(date2)) {
-      res.status(400).send({ message: "Fecha 1 debe ser menor a fecha 2" });
-      return;
-    }
-  } catch (err) {
-    console.error(err);
-    res.status(400).send({ message: "Datos invalidos" });
-    return;
-  }
-
-  // Redis cache
-  const cacheKey = `cities:${city}:${date1}:${date2}`;
-  const cachedData = await redis.get(cacheKey);
-  if (cachedData) {
-    console.log(`\nCACHE HIT\n`);
-    res.send(JSON.parse(cachedData));
-    return;
-  }
-
-  const url = `${baseURL}/${city}/${date1}/${date2}?unitGroup=metric&key=${weatherAPIKEY}`;
-
-  // 4. Llamar la API externa
-  try {
-    console.log("Fetching:", url);
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      res
-        .status(response.status)
-        .send({ error: "No se pudo obtener el clima para esa ciudad" });
-      return;
-    }
-    const data = await response.json();
-    await redis.setEx(cacheKey, DEF_TTL, JSON.stringify(data));
-    res.send(data);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send();
-    return;
-  }
-});
+  },
+);
 
 // Ruta para ver cuantas ciudades hay cacheadas en Redis - GET /cache/status
 app.get("/cache/status", async (req, res) => {
