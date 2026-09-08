@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import { weatherDateSchema, weatherCitySchema } from "./schemas/weather";
-import IORedis from "ioredis";
+import Redis from "ioredis";
 import rateLimit from "@fastify/rate-limit";
 
 const weatherAPIKEY = process.env.WEATHER_API_KEY || "";
@@ -20,18 +20,17 @@ const app = Fastify({
 });
 
 // Cliente Redis
-let redis;
-try {
-  redis = new IORedis();
-} catch (err) {
-  console.error("No se pudo conectar a Redis. ¿Está corriendo?", err);
-  process.exit(1);
-}
+const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+const redis = new Redis(redisUrl);
+
+redis.on("error", (err) => {
+  console.error("[ioredis] Error de conexión:", err.message);
+});
 
 await app.register(rateLimit, {
   max: 10,
   timeWindow: "1 minute",
-  redis: redis,
+  // redis: redis,
 });
 
 app.get("/", function (request, reply) {
@@ -215,7 +214,7 @@ app.delete("/cache/:city", async (req, res) => {
   return;
 });
 
-app.listen({ port: 3000 }, function (err, address) {
+app.listen({ port: 3000, host: "0.0.0.0" }, function (err, address) {
   if (err) {
     app.log.error(err);
     process.exit(1);

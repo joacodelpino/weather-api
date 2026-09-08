@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - WEATHER_API_KEY=${WEATHER_API_KEY}
+      - ENDPOINT_URL=${ENDPOINT_URL}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
